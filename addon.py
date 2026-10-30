@@ -1479,7 +1479,7 @@ def _tmdb_backfill():
     every 10 min for shows with no/stale/old-format cache, paced ~3 req/s."""
     if not TMDB_API_KEY:
         return
-    time.sleep(30)
+    time.sleep(240 if _LOW else 30)
     _TMDB_LOADED.wait(900)           # only look things up that the DB really does not have
     while True:
         try:
@@ -1489,10 +1489,13 @@ def _tmdb_backfill():
                         if not _tmdb_fresh(_TMDB_CACHE.get(r["slug"]))
                         and now - _TMDB_FAIL.get(r["slug"], 0) >= TMDB_RETRY]
             n = 0
+            if _LOW:
+                todo = todo[:_env_int("TMDB_PER_ROUND", 30)]      # a few titles per round, the rest next time
             for rec in todo:
+                _bg_wait()
                 if _tmdb_refresh(rec):
                     n += 1
-                time.sleep(0.3)
+                time.sleep(4 if _LOW else 0.3)
             if todo:
                 print(f"[rt2] tmdb backfill: {n}/{len(todo)} shows updated", flush=True)
         except Exception as e:
@@ -2825,8 +2828,9 @@ def _serve_img(handler, token, url=None):
 def _img_prewarm():
     """Background: pull every poster to disk once (visible-first), so a
     visitor never waits on the source site for a picture."""
-    time.sleep(8)
+    time.sleep(60 if _LOW else 8)
     while True:
+        _bg_wait()
         try:
             order, seen = [], set()
             upd = _updates()
@@ -2840,6 +2844,8 @@ def _img_prewarm():
             q = [sl for sl in order
                  if (SHOWS[sl].get("poster") or "").startswith("https://")
                  and not os.path.exists(_img_path("s:" + sl))]
+            if _LOW:
+                q = q[:_env_int("PREWARM_MAX", 120)]     # the rest is fetched when somebody asks for it
             lock = threading.Lock()
 
             def _worker():
@@ -2848,12 +2854,13 @@ def _img_prewarm():
                         if not q:
                             return
                         sl = q.pop(0)
+                    _bg_wait()
                     try:
                         _img_load("s:" + sl, SHOWS[sl]["poster"])
                     except Exception:
                         pass
-                    time.sleep(0.1)
-            ws = [threading.Thread(target=_worker, daemon=True) for _ in range(3)]
+                    time.sleep(0.6 if _LOW else 0.1)
+            ws = [threading.Thread(target=_worker, daemon=True) for _ in range(1 if _LOW else 3)]
             for w in ws:
                 w.start()
             for w in ws:
@@ -4202,6 +4209,31 @@ class Handler(BaseHTTPRequestHandler):
         self._is_head = False
         self._route()
 
+    def _starting(self, path):
+        """Boot is not finished: a page request gets the themed waiting page, everything else a quick 503."""
+        accept = self.headers.get("Accept") or ""
+        is_page = path.rstrip("/") in ("", "/") or ("text/html" in accept and not path.startswith(("/api/", "/mq/", "/wn/", "/img/")))
+        if is_page:
+            body = _STARTING_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if not self._is_head:
+                self.wfile.write(body)
+            return
+        body = b'{"starting":true,"retry":5}'
+        self.send_response(503)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Retry-After", "5")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if not self._is_head:
+            self.wfile.write(body)
+
     def _gctx(self, qs=None):
         """Per request: real IP + VIP check (guard.py). Never breaks the request."""
         self._mqtok = ""            # one Handler serves many keep-alive requests: never reuse an old token
@@ -4549,6 +4581,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self._is_head = False
         path = unquote(urlparse(self.path).path)
+        if not _READY.is_set() and not path.startswith("/api/admin"):
+            try:
+                self._body()
+            except Exception:
+                pass
+            return self._starting(path)
         self._gctx(parse_qs(urlparse(self.path).query))
         try:
             b = self._body()
@@ -4691,6 +4729,10 @@ class Handler(BaseHTTPRequestHandler):
             path = mv.group(2)
         if path in ("/healthz", "/_health"):          # instant answer for the host's health check
             return self._send_raw(b"ok", "text/plain")
+        if path == "/api/ready":
+            return self._send({"ready": _READY.is_set(), "up": int(time.time() - _BOOT_T)})
+        if not _READY.is_set() and not path.startswith(("/admin", "/api/admin")):
+            return self._starting(path)
         self._gctx(qs)
         _public_base_holder["base"] = public_base_from(self)
         try:
@@ -4957,7 +4999,7 @@ print("[rt2] BOOT v=" + VERSION, flush=True)
 def _auto_refresh():
     """Keeps episode lists fresh without a redeploy: re-reads one series'
     hub page every AUTO_REFRESH_SECONDS, oldest-checked first."""
-    gap = float(os.environ.get("AUTO_REFRESH_SECONDS", "5"))
+    gap = float(os.environ.get("AUTO_REFRESH_SECONDS", "120" if _LOW else "5"))
     if gap <= 0:
         return
     last = {}
@@ -4966,8 +5008,9 @@ def _auto_refresh():
     except Exception:
         last = {}
     saved_at = time.time()
-    time.sleep(60)
+    time.sleep(180 if _LOW else 60)
     while True:
+        _bg_wait()
         try:
             with STORE_LOCK:
                 slugs = [k for k, r in SHOWS.items() if not r["movie"] and r.get("hub")]
@@ -5132,9 +5175,10 @@ def _fresh_watch():
     if gap <= 0:
         return
     # restart-safe: if the last check was less than `gap` ago, wait out the rest
-    time.sleep(max(45.0, gap - (time.time() - _kv_float("t_fresh"))))
+    time.sleep(max(300.0 if _LOW else 45.0, gap - (time.time() - _kv_float("t_fresh"))))
     while True:
         t0 = time.time()
+        _bg_wait()
         try:
             _fresh_tick(pages)
             _kv_put("t_fresh", time.time())
@@ -5158,14 +5202,15 @@ def _catalog_refresh():
         that are weeks/months old and simply never got crawled in the
         first place (the original gap, not just a freshness gap) get
         picked up too. Slower, so it runs less often."""
-    gap = float(os.environ.get("CATALOG_REFRESH_SECONDS", "3600"))
-    full_gap = float(os.environ.get("CATALOG_FULL_REFRESH_SECONDS", str(24 * 3600)))
+    gap = float(os.environ.get("CATALOG_REFRESH_SECONDS", "21600" if _LOW else "3600"))
+    full_gap = float(os.environ.get("CATALOG_FULL_REFRESH_SECONDS", "0" if _LOW else str(24 * 3600)))   # 0 = never (episodes_index.jsonl is refreshed by the GitHub crawl)
     if gap <= 0:
         return
     # restart-safe: the last run (and the last FULL walk) are remembered in the DB
-    time.sleep(max(120.0, gap - (time.time() - _kv_float("t_catalog"))))
+    time.sleep(max(900.0 if _LOW else 120.0, gap - (time.time() - _kv_float("t_catalog"))))
     last_full = _kv_float("t_catalog_full")
     while True:
+        _bg_wait()
         try:
             import refresh_index
             do_full = full_gap > 0 and time.time() - last_full >= full_gap
@@ -5272,15 +5317,17 @@ def _hourly_sync():
     restart (no fetch at all when the last sync was less than an hour ago)."""
     if SYNC_SECONDS <= 0:
         return
-    time.sleep(max(60.0, SYNC_SECONDS - (time.time() - _kv_float("sync_t"))))
+    sec = SYNC_SECONDS * (3 if _LOW and not os.environ.get("SYNC_SECONDS") else 1)
+    time.sleep(max(600.0 if _LOW else 60.0, sec - (time.time() - _kv_float("sync_t"))))
     while True:
         t0 = time.time()
+        _bg_wait()
         try:
             _sync_once()
             _kv_put("sync_t", time.time())
         except Exception as e:
             print("[sync] failed:", repr(e), flush=True)
-        time.sleep(max(60.0, SYNC_SECONDS - (time.time() - t0)))
+        time.sleep(max(60.0, sec - (time.time() - t0)))
 
 
 def _boot_from_db():
@@ -5349,6 +5396,99 @@ MEM_SOFT_MB = _env_int("MEM_SOFT_MB", int(_LIM_MB * 0.65) if _LIM_MB else 450)  
 MEM_HARD_MB = _env_int("MEM_HARD_MB", int(_LIM_MB * 0.80) if _LIM_MB else 600)    # above this: also drop the poster memory cache
 
 
+# ---------------------------------------------------------------- low-CPU mode ---
+# Free panel hosts (Wispbyte) STOP the server when the average CPU is too high.  So on a small host
+# (SERVER_PORT set = panel host, or RAM limit <= 1 GB, or LOW_CPU=1) the background work is slowed down
+# and a governor pauses it whenever the app's own CPU use climbs above CPU_TARGET percent of one core.
+# Visitors' requests are never paused - only the background crawlers / poster downloads.  LOW_CPU=0 turns it off.
+_lc = (os.environ.get("LOW_CPU") or "").strip().lower()
+_LOW = (_lc in ("1", "on", "yes", "true")) if _lc else bool(os.environ.get("SERVER_PORT") or (0 < _LIM_MB <= 1024))
+CPU_TARGET = float(os.environ.get("CPU_TARGET") or 12)          # % of one core, averaged over ~2 minutes
+_cpu_hot = threading.Event()
+_cpu_now = {"pct": 0.0}
+
+
+# ------------------------------------------------------------ starting screen ---
+# Until the boot work is finished (lists built, caches warm) visitors get an anime-themed "server is
+# starting" page that polls /api/ready and opens the site by itself - nobody sees a half-loaded site.
+# STARTUP_SCREEN=0 turns it off.  READY_MAX = longest wait in seconds (then the site opens anyway).
+_READY = threading.Event()
+_STARTING_ON = (os.environ.get("STARTUP_SCREEN") or "1").strip().lower() not in ("0", "off", "no", "false")
+READY_MAX = _env_int("READY_MAX", 240)
+if not _STARTING_ON:
+    _READY.set()
+
+_STARTING_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>mollad_jaat - starting</title>
+<style>
+:root{--accent:#ff4d2a}
+*{box-sizing:border-box}html,body{height:100%;margin:0}
+body{display:flex;align-items:center;justify-content:center;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+background:radial-gradient(1200px 700px at 50% -10%,#3a1620 0,#14141c 55%,#0b0b10 100%);color:#f3efe9;overflow:hidden}
+.box{text-align:center;padding:24px;max-width:420px;width:100%}
+.logo{font-weight:800;font-size:26px;letter-spacing:.5px}.logo b{color:var(--accent)}
+.ring{width:92px;height:92px;margin:28px auto 22px;position:relative}
+.ring i{position:absolute;inset:0;border-radius:50%;border:4px solid transparent;border-top-color:var(--accent);animation:sp 1.1s linear infinite}
+.ring i:nth-child(2){inset:12px;border-top-color:#ffb199;animation-duration:1.7s;animation-direction:reverse}
+.ring i:nth-child(3){inset:26px;border-top-color:#fff;animation-duration:2.4s}
+.ring span{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:26px}
+@keyframes sp{to{transform:rotate(360deg)}}
+h1{font-size:20px;margin:0 0 8px}p{margin:0;color:#b9b4ad;font-size:14px;line-height:1.5}
+.bar{height:6px;border-radius:6px;background:#ffffff1a;margin:22px 6px 10px;overflow:hidden}
+.bar div{height:100%;width:6%;background:linear-gradient(90deg,var(--accent),#ffb199);border-radius:6px;transition:width .8s ease}
+.tip{font-size:12px;color:#8d8882;min-height:18px}
+.petal{position:fixed;top:-20px;width:10px;height:10px;border-radius:50% 0 50% 0;background:#ff8fa3;opacity:.7;animation:fall linear infinite}
+@keyframes fall{to{transform:translateY(110vh) rotate(540deg)}}
+</style></head><body>
+<script>for(var i=0;i<14;i++){var d=document.createElement("div");d.className="petal";d.style.left=(Math.random()*100)+"vw";
+d.style.animationDuration=(6+Math.random()*8)+"s";d.style.animationDelay=(-Math.random()*10)+"s";d.style.opacity=.3+Math.random()*.5;document.body.appendChild(d)}</script>
+<div class="box"><div class="logo">mollad<b>_</b>jaat</div>
+<div class="ring"><i></i><i></i><i></i><span>&#127884;</span></div>
+<h1>Server start ho raha hai</h1>
+<p>Anime ki list aur video links taiyar ho rahe hain.<br>Page apne aap khul jayega, bas thoda ruko.</p>
+<div class="bar"><div id="b"></div></div><div class="tip" id="t">Starting...</div></div>
+<script>
+var tips=["Posters aur episodes load ho rahe hain...","Database se purana data wapas aa raha hai...","Trending list ban rahi hai...","Bas kuch hi der aur..."];
+var n=0,left=0;
+function tick(){fetch("/api/ready",{cache:"no-store"}).then(function(r){return r.json()}).then(function(j){
+ if(j&&j.ready){document.getElementById("b").style.width="100%";document.getElementById("t").textContent="Ready!";setTimeout(function(){location.reload()},350);return}
+ var p=Math.min(94,6+(j.up||0)*0.55);document.getElementById("b").style.width=p+"%";
+ document.getElementById("t").textContent=tips[Math.floor(n/3)%tips.length];n++;setTimeout(tick,3000)}).catch(function(){
+ document.getElementById("t").textContent="Server abhi jag raha hai...";setTimeout(tick,4000)})}
+tick();
+</script></body></html>"""
+
+
+def _bg_wait(limit=600):
+    """Background loops call this between jobs: it waits while the app is using too much CPU."""
+    t0 = time.time()
+    while _cpu_hot.is_set() and time.time() - t0 < limit:
+        time.sleep(3)
+
+
+def _cpu_watch():
+    last_c, last_w, avg, n = time.process_time(), time.time(), 0.0, 0
+    while True:
+        time.sleep(4)
+        try:
+            c, w = time.process_time(), time.time()
+            pct = 100.0 * (c - last_c) / max(0.001, w - last_w)
+            last_c, last_w = c, w
+            avg = pct if n == 0 else avg * 0.5 + pct * 0.5           # reacts within ~10 s: no long 100% burst
+            n += 1
+            _cpu_now["pct"] = round(avg, 1)
+            if n % 8 == 0 and (n < 300 or _cpu_hot.is_set()):         # every ~30 s for the first 20 min
+                print(f"[cpu] now={avg:.0f}% target={CPU_TARGET:.0f}% paused={_cpu_hot.is_set()}", flush=True)
+            if avg > CPU_TARGET and not _cpu_hot.is_set():
+                _cpu_hot.set()
+                print(f"[cpu] {avg:.0f}% > {CPU_TARGET:.0f}% -> background work paused", flush=True)
+            elif avg < CPU_TARGET * 0.6 and _cpu_hot.is_set():
+                _cpu_hot.clear()
+                print(f"[cpu] {avg:.0f}% -> background work resumed", flush=True)
+        except Exception:
+            pass
+
+
 def _mem_watch():
     """Every 30 s: print RAM use, and when it climbs, clean up BEFORE the host kills the app."""
     import gc
@@ -5377,51 +5517,57 @@ def _mem_watch():
 
 
 def _startup():
+    try:
+        _startup_work()
+    except Exception as e:
+        print("[rt2] startup error:", repr(e)[:150], flush=True)
+    finally:
+        _READY.set()
+        print(f"[rt2] READY after {int(time.time() - _BOOT_T)} s - site is open", flush=True)
+
+
+def _startup_work():
     """Restore everything saved in the DB FIRST, then start the workers - so
-    nothing is fetched again that the last run already has."""
+    nothing is fetched again that the last run already has.
+    Low-CPU mode: the heavy jobs are spread out (one after the other, each waits while the CPU is busy),
+    because a free host stops the app if the CPU stays high for ~90 s."""
     threading.Thread(target=shows_payload, daemon=True).start()   # build the home page list right now, not after the DB wait
     threading.Thread(target=_mem_watch, daemon=True).start()
+    if _LOW:
+        print(f"[cpu] low-CPU mode ON (target {CPU_TARGET:.0f}% of one core)", flush=True)
+        threading.Thread(target=_cpu_watch, daemon=True, name="cpu-watch").start()
     threading.Thread(target=_restore_from_db, daemon=True).start()
+    if _LOW:
+        time.sleep(6)                        # let the first page build finish before the next heavy job
+        _bg_wait(90)
     threading.Thread(target=_tmdb_boot, daemon=True).start()
-    # (no wait for the DB here any more: the workers below start at once and the DB restore runs beside them)
+    _DB_READY.wait(300)              # cold DB: give it up to 5 min, then go on with the saved files
+    if _LOW:
+        time.sleep(6)
+        _bg_wait(90)
     threading.Thread(target=_hourly_sync, daemon=True).start()
     threading.Thread(target=_auto_refresh, daemon=True).start()
     threading.Thread(target=_catalog_refresh, daemon=True).start()
     threading.Thread(target=_fresh_watch, daemon=True).start()
     threading.Thread(target=_tmdb_backfill, daemon=True).start()
     threading.Thread(target=_img_prewarm, daemon=True).start()    # posters -> disk
-    _updates(); _popular(); _trending("week"); _trending("day"); _trending("movies")   # warm the caches at boot
+    for _warm in (_updates, _popular, lambda: _trending("week"), lambda: _trending("day"), lambda: _trending("movies")):
+        if _LOW:
+            _bg_wait(90)
+            time.sleep(2)
+        try:
+            _warm()                                               # warm the caches at boot
+        except Exception as e:
+            print("[rt2] warm-up failed:", repr(e)[:100], flush=True)
 
     def _posters():
         with STORE_LOCK:
             missing = [r for r in SHOWS.values() if not r.get("poster")]
         for rec in missing:
+            _bg_wait()
             _fetch_poster(rec)
-            time.sleep(1)
+            time.sleep(3 if _LOW else 1)
     threading.Thread(target=_posters, daemon=True).start()
-
-
-def _user_quick(tok, name, wait=1.5):
-    """The user object for a sign-in answer.  The DB may be slow: after `wait` s send just the name
-    (the app is signed in at once and fills in the rest from /api/me)."""
-    box = {}
-
-    def _j():
-        try:
-            box["u"] = accounts.user_for(tok)
-        except Exception:
-            pass
-    t = threading.Thread(target=_j, daemon=True)
-    t.start()
-    t.join(wait)
-    return box.get("u") or {"username": (name or "").lower()}
-
-
-def _safe(fn, *a):
-    try:
-        return fn(*a)
-    except Exception as e:
-        applog.log_once("safe-" + getattr(fn, "__name__", "fn"), 120, "warn", "app", f"{getattr(fn, '__name__', 'call')} failed: {e!r}")
 
 
 class _LimitedServer(ThreadingHTTPServer):
@@ -5473,12 +5619,22 @@ def _tunnel_loop(token, port):
                 time.sleep(15)
         else:
             return
+    import re as _re
     while True:
         try:
-            print("[tunnel] starting cloudflared -> localhost:%d" % port, flush=True)
-            p = subprocess.Popen([exe, "tunnel", "--no-autoupdate", "--protocol", "http2",
-                                  "run", "--token", token],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if token:
+                print("[tunnel] starting cloudflared (named tunnel) -> localhost:%d" % port, flush=True)
+                cmd = [exe, "tunnel", "--no-autoupdate", "--protocol", "http2", "run", "--token", token]
+            else:
+                print("[tunnel] starting free quick tunnel -> localhost:%d" % port, flush=True)
+                cmd = [exe, "tunnel", "--no-autoupdate", "--protocol", "http2",
+                       "--url", "http://localhost:%d" % port]
+            p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                 text=True, errors="replace")
+            for line in p.stderr:                      # must be read, else the pipe fills up and cloudflared stalls
+                m = _re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
+                if m:
+                    print("[tunnel] ==== SITE LINK: %s ====" % m.group(0), flush=True)
             p.wait()
             print("[tunnel] cloudflared stopped (code %s), restarting in 10 s" % p.returncode, flush=True)
         except Exception as e:
@@ -5500,8 +5656,12 @@ def main():
     threading.Thread(target=_startup, daemon=True).start()        # port opens at once
     port = int(sys.argv[1]) if len(sys.argv) > 1 else PORT
     srv = _LimitedServer(("0.0.0.0", port), Handler)
+    if _STARTING_ON:
+        _t = threading.Timer(READY_MAX, lambda: (_READY.set(), print("[rt2] READY (timeout)", flush=True)))
+        _t.daemon = True
+        _t.start()
     _tk = (os.environ.get("CF_TUNNEL_TOKEN") or "").strip()
-    if _tk:
+    if _tk or (os.environ.get("QUICK_TUNNEL") or "").strip().lower() in ("1", "on", "yes", "true"):
         threading.Thread(target=_tunnel_loop, args=(_tk, port), daemon=True, name="tunnel").start()
     print(f"[rt2] {ADDON_NAME} v{VERSION} | series={len(SERIES)} "
           f"movies={len(MOVIES)} rows={len(ROWS)} posters={len(POSTERS)}")
